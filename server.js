@@ -7,41 +7,97 @@ import { PDFDocument, PDFName, PDFRawStream } from 'pdf-lib';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Allow requests from your Vercel frontend
-const allowedOrigins = [
-  'https://kss-pdf-studio.vercel.app',
-  'http://localhost:5173',
-  'http://localhost:3000',
-];
-
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (e.g. curl, Postman)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.some(o => origin.startsWith(o.replace('https://', '').replace('http://', '')))) {
+    if (origin.endsWith('.vercel.app') || origin.endsWith('.railway.app')) {
       return callback(null, true);
     }
-    // Also allow any vercel.app subdomain for preview deployments
-    if (origin.endsWith('.vercel.app')) return callback(null, true);
-    callback(new Error('Not allowed by CORS'));
+    if (origin.includes('localhost')) return callback(null, true);
+    callback(null, true); // Allow all origins for now
   },
   exposedHeaders: ['X-Original-Size', 'X-Compressed-Size', 'X-Compression-Ratio'],
 }));
 
 app.use(express.json());
 
-// Multer — store in memory, 200MB limit
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 200 * 1024 * 1024 },
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'kss-pdf-compress-api' });
 });
 
-// Compress endpoint
+// Detect image format from bytes magic numbers
+function detectImageFormat(bytes) {
+  if (!bytes || bytes.length < 4) return null;
+  
+  // JPEG: FF D8 FF
+  if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return 'jpeg';
+  
+  // PNG: 89 50 4E 47
+  if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'png';
+  
+  // GIF: 47 49 46
+  if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'gif';
+  
+  // TIFF: 49 49 or 4D 4D
+  if ((bytes[0] === 0x49 && bytes[1] === 0x49) || (bytes[0] === 0x4D && bytes[1] === 0x4D)) return 'tiff';
+  
+  // WebP: 52 49 46 46
+  if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return 'webp';
+  
+  return null;
+}
+
+// Build a proper image buffer from PDF image stream + metadata
+function buildImageBuffer(bytes, dict, pdfDoc) {
+  const format = detectImageFormat(bytes);
+  
+  // If we can detect a known format, use it directly
+  if (format) return { buffer: Buffer.from(bytes), format };
+  
+  // Otherwise treat as raw pixel data and construct metadata from PDF dict
+  try {
+    const widthObj = dict.get(PDFName.of('Width'));
+    const heightObj = dict.get(PDFName.of('Height'));
+    const bpcObj = dict.get(PDFName.of('BitsPerComponent'));
+    const csObj = dict.get(PDFName.of('ColorSpace'));
+
+    const width = widthObj?.numberValue ?? widthObj?.asNumber?.() ?? 0;
+    const height = heightObj?.numberValue ?? heightObj?.asNumber?.() ?? 0;
+    const bpc = bpcObj?.numberValue ?? bpcObj?.asNumber?.() ?? 8;
+    
+    if (!width || !height) return null;
+
+    // Determine channels from ColorSpace
+    let channels = 3; // default RGB
+    if (csObj) {
+      const cs = csObj.toString();
+      if (cs.includes('Gray') || cs.includes('grey')) channels = 1;
+      else if (cs.includes('CMYK')) channels = 4;
+      else if (cs.includes('RGB')) channels = 3;
+    }
+
+    // Validate byte length matches expected raw pixel data
+    const expectedBytes = width * height * channels * (bpc / 8);
+    if (Math.abs(bytes.length - expectedBytes) < expectedBytes * 0.1) {
+      // Looks like raw pixel data — wrap it with sharp's raw input
+      return {
+        buffer: Buffer.from(bytes),
+        format: 'raw',
+        raw: { width, height, channels }
+      };
+    }
+  } catch {
+    // ignore
+  }
+  
+  return null;
+}
+
 app.post('/compress', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
@@ -62,6 +118,7 @@ app.post('/compress', upload.single('file'), async (req, res) => {
     const pdfDoc = await PDFDocument.load(req.file.buffer, { ignoreEncryption: true });
     const objects = pdfDoc.context.enumerateIndirectObjects();
     let imagesProcessed = 0;
+    let imagesSkipped = 0;
 
     for (const [, obj] of objects) {
       if (!(obj instanceof PDFRawStream)) continue;
@@ -69,7 +126,6 @@ app.post('/compress', upload.single('file'), async (req, res) => {
       if (dict.get(PDFName.of('Subtype')) !== PDFName.of('Image')) continue;
 
       try {
-        // Get image dimensions
         const widthObj = dict.get(PDFName.of('Width'));
         const heightObj = dict.get(PDFName.of('Height'));
         const width = widthObj?.numberValue ?? widthObj?.asNumber?.() ?? 0;
@@ -78,10 +134,27 @@ app.post('/compress', upload.single('file'), async (req, res) => {
         // Skip tiny images
         if (width < 50 || height < 50) continue;
 
-        // Try to process with Sharp
-        let sharpImg = sharp(obj.contents, { failOnError: false });
+        const imageInfo = buildImageBuffer(obj.contents, dict, pdfDoc);
+        if (!imageInfo) { imagesSkipped++; continue; }
+
+        let sharpImg;
+        if (imageInfo.format === 'raw' && imageInfo.raw) {
+          // Raw pixel data — tell Sharp the exact format
+          sharpImg = sharp(imageInfo.buffer, {
+            raw: {
+              width: imageInfo.raw.width,
+              height: imageInfo.raw.height,
+              channels: imageInfo.raw.channels,
+            },
+            failOnError: false,
+          });
+        } else {
+          // Known format (JPEG, PNG, etc.)
+          sharpImg = sharp(imageInfo.buffer, { failOnError: false });
+        }
+
         const meta = await sharpImg.metadata().catch(() => null);
-        if (!meta?.width || !meta?.height) continue;
+        if (!meta?.width || !meta?.height) { imagesSkipped++; continue; }
 
         // Resize if needed
         if (settings.scale < 1.0) {
@@ -94,7 +167,7 @@ app.post('/compress', upload.single('file'), async (req, res) => {
           .jpeg({ quality: settings.quality, mozjpeg: true, chromaSubsampling: '4:2:0' })
           .toBuffer();
 
-        // Only replace if it actually got smaller
+        // Only replace if smaller
         if (compressed.length < obj.contents.length) {
           const newMeta = await sharp(compressed).metadata();
           obj.contents = compressed;
@@ -109,7 +182,8 @@ app.post('/compress', upload.single('file'), async (req, res) => {
           dict.delete(PDFName.of('DecodeParms'));
           imagesProcessed++;
         }
-      } catch {
+      } catch (imgErr) {
+        imagesSkipped++;
         continue;
       }
     }
@@ -135,7 +209,7 @@ app.post('/compress', upload.single('file'), async (req, res) => {
     const compressedSize = compressedPdf.length;
     const ratio = ((1 - compressedSize / originalSize) * 100).toFixed(1);
 
-    console.log(`[compress] Done. Images: ${imagesProcessed} | ${(originalSize/1024/1024).toFixed(2)}MB → ${(compressedSize/1024/1024).toFixed(2)}MB | ${ratio}% reduction`);
+    console.log(`[compress] Done. Processed: ${imagesProcessed} | Skipped: ${imagesSkipped} | ${(originalSize/1024/1024).toFixed(2)}MB → ${(compressedSize/1024/1024).toFixed(2)}MB | ${ratio}% reduction`);
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="compressed.pdf"`);
